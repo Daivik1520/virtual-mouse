@@ -16,6 +16,12 @@ import json
 class VirtualMouse:
     def __init__(self):
         # Initialize camera and hand detection
+        try:
+            # Enable OpenCV optimizations
+            cv2.setUseOptimized(True)
+            cv2.setNumThreads(2)
+        except Exception:
+            pass
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             print("Error: Could not open camera. Please check camera permissions.")
@@ -23,16 +29,24 @@ class VirtualMouse:
             print("Make sure Terminal or your Python application has camera access.")
             exit(1)
         
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Prefer lower resolution for reduced processing latency
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Reduce internal buffering where supported to avoid stale frames
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         
         # MediaPipe setup
         self.mp_hands = mp.solutions.hands
+        # Use lower model complexity for faster inference
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
             min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
+            model_complexity=0
         )
         self.mp_drawing = mp.solutions.drawing_utils
         
@@ -43,12 +57,19 @@ class VirtualMouse:
         self.click_threshold = 25
         self.move_threshold = 100
         self.scroll_threshold = 30
-        self.drag_threshold = 40
+        self.drag_threshold = 40  # legacy single threshold (kept for compatibility)
+        # Easier and more stable drag with hysteresis and small debounce
+        self.drag_start_threshold = 55  # start dragging when index+pinky distance < 55
+        self.drag_end_threshold = 80    # stop dragging when distance > 80
+        self.drag_debounce_frames = 3   # require gesture condition for N frames to avoid flicker
+        self._drag_on_counter = 0
+        self._drag_off_counter = 0
         self.volume_threshold = 35
         self.keyboard_threshold = 30
         
         # Smoothing for mouse movement
-        self.smoothing_factor = 0.7
+        # Lower smoothing for snappier cursor response (tunable)
+        self.smoothing_factor = 0.3
         self.prev_x, self.prev_y = 0, 0
         
         # Gesture state tracking
@@ -62,7 +83,8 @@ class VirtualMouse:
         self.click_cooldown = 0.3  # seconds
         
         # Movement smoothing buffer
-        self.movement_buffer = deque(maxlen=5)
+        # Keep a small movement buffer to avoid over-smoothing
+        self.movement_buffer = deque(maxlen=3)
         
         # Voice recognition setup
         try:
@@ -137,15 +159,152 @@ class VirtualMouse:
         }
         
         # Settings
+        # Runtime settings, including performance-focused toggles
         self.settings = {
-            'sensitivity': 1.0,
-            'smoothing': 0.7,
+            'sensitivity': 2.0,
+            'smoothing': 0.3,
             'click_delay': 0.3,
-            'voice_feedback': True
+            'voice_feedback': True,
+            'performance_mode': True,
+            'show_overlay': False,
+            'show_usage': False,
+            # Safer defaults to avoid unintended actions
+            'apps_enabled': False,
+            'voice_commands_enabled': False,
+            'shortcuts_enabled': False,
+            'app_launcher_hold_seconds': 1.0,
+            'virtual_keyboard_enabled': False
         }
+
+        self.setup_virtual_keyboard()
+        self.vk_clk = 1
+        
+        self.prev_screen_x = 0
+        self.prev_screen_y = 0
+
+        # Minimize PyAutoGUI's built-in pause for faster actions
+        try:
+            pyautogui.PAUSE = 0
+            pyautogui.FAILSAFE = False
+            pyautogui.MINIMUM_DURATION = 0
+            pyautogui.MINIMUM_SLEEP = 0
+        except Exception:
+            pass
+
+        # Frame capture thread to always provide the freshest frame
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.running = False
+        # Debounce timers
+        self.app_launcher_detected_since = None
         
         self.load_settings()
         self.print_controls()
+
+        # Apply performance settings right away
+        self.apply_performance_settings()
+
+    def apply_performance_settings(self):
+        """Apply performance-mode preferences (overlay, smoothing, voice)."""
+        if self.settings.get('performance_mode', False):
+            self.settings['show_overlay'] = False
+            self.settings['voice_feedback'] = False
+            self.smoothing_factor = 0.15 # Snappy response
+        else:
+            self.smoothing_factor = self.settings.get('smoothing', 0.5)
+
+    def setup_virtual_keyboard(self):
+        """Initialize the virtual keyboard layout."""
+        self.vk_keys = [
+            ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
+            ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ':'],
+            ['z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '?']
+        ]
+        self.vk_size = 500 / 500
+        self.vk_buttonList = []
+        
+        # Populate basic keys
+        for i in range(len(self.vk_keys)):
+            for j, key in enumerate(self.vk_keys[i]):
+                x = int((j * 60 * self.vk_size) + 25)
+                y = int((i * 60 * self.vk_size) + 60)
+                h = int(x + 50 * self.vk_size)
+                w = int(y + 50 * self.vk_size)
+                self.vk_buttonList.append([x, y, h, w, key])
+                
+        # Populate special keys
+        xs = lambda i: int((i * 60 * self.vk_size) + 25)
+        ys = lambda y: int((y * 60 * self.vk_size) + 60)
+        hws = lambda hw: int(hw + 50 * self.vk_size)
+        
+        self.vk_buttonList.append([xs(0), ys(len(self.vk_keys)), hws(xs(3)), hws(ys(len(self.vk_keys))), 'backspace'])
+        self.vk_buttonList.append([xs(4), ys(len(self.vk_keys)), hws(xs(6)), hws(ys(len(self.vk_keys))), 'capslock'])
+        self.vk_buttonList.append([xs(7), ys(len(self.vk_keys)), hws(xs(9)), hws(ys(len(self.vk_keys))), 'enter'])
+        self.vk_buttonList.append([xs(1), ys(len(self.vk_keys) + 1), hws(xs(8)), hws(ys(len(self.vk_keys) + 1)), ' '])
+
+    def draw_virtual_keyboard(self, frame):
+        """Draw the virtual keyboard onto the frame."""
+        for x, y, h, w, key in self.vk_buttonList:
+            cv2.rectangle(frame, (x, y), (h, w), (0, 0, 0), 2)
+            cv2.putText(frame, key, (x + 12, y + 29), cv2.FONT_HERSHEY_PLAIN, 2, (0, 0, 255), 2)
+
+    def draw_usage_overlay(self, frame):
+        """Draw always-visible usage instructions on the UI."""
+        try:
+            lines = [
+                "Controls:",
+                "Index finger: Move cursor",
+                "Index + Thumb: Left Click",
+                "Index + Middle: Right Click",
+                "Index + Ring: Scroll",
+                "Index + Pinky: Drag",
+                "q: Quit  s: Settings  h: Help  r: Reset",
+                "o: Overlay  p: Performance  u: Usage",
+                "a: Apps ON/OFF  v: Voice ON/OFF  k: Shortcuts ON/OFF",
+                "b: Keyboard ON/OFF",
+            ]
+
+            # Panel size and position (top-left)
+            x0, y0 = 8, 8
+            width, line_h = 420, 22
+            height = line_h * (len(lines) + 1)
+
+            # Semi-transparent background
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (x0, y0), (x0 + width, y0 + height), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+            # Draw text lines
+            for i, text in enumerate(lines):
+                y = y0 + 24 + i * line_h
+                cv2.putText(frame, text, (x0 + 10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        except Exception:
+            # Fail silently if drawing fails, to avoid crashing the loop
+            pass
+
+    def start_capture_thread(self):
+        """Start a background thread that continually grabs the latest camera frame."""
+        self.running = True
+
+        def _reader():
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    continue
+                with self.frame_lock:
+                    # Keep only the most recent frame to avoid latency
+                    self.latest_frame = frame
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+
+    def get_latest_frame(self):
+        """Return the most recent frame captured by the thread."""
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            # Return a copy to avoid race conditions
+            return self.latest_frame.copy()
 
     def print_controls(self):
         """Print comprehensive control instructions"""
@@ -424,9 +583,11 @@ class VirtualMouse:
             self.modes['voice'] = False
             self.modes['app_launcher'] = False
             
-            # Move cursor
+            # Move cursor (optimized to only send events if moved > 2 pixels)
             if distances['index_thumb'] > self.move_threshold:
-                pyautogui.moveTo(screen_x, screen_y)
+                if abs(screen_x - getattr(self, 'prev_screen_x', 0)) > 2 or abs(screen_y - getattr(self, 'prev_screen_y', 0)) > 2:
+                    pyautogui.moveTo(screen_x, screen_y)
+                    self.prev_screen_x, self.prev_screen_y = screen_x, screen_y
             
             # Left click (index + thumb)
             if (distances['index_thumb'] < self.click_threshold and 
@@ -454,23 +615,36 @@ class VirtualMouse:
                     self.is_scrolling = True
                     print("🖱️  Scroll executed")
             
-            # Drag (index + pinky)
-            elif distances['index_pinky'] < self.drag_threshold:
-                if not self.is_dragging:
+            # Drag (index + pinky) with hysteresis and debounce to make it easier and stable
+            drag_dist = distances['index_pinky']
+            if not self.is_dragging:
+                if drag_dist < self.drag_start_threshold:
+                    self._drag_on_counter += 1
+                else:
+                    self._drag_on_counter = 0
+                if self._drag_on_counter >= self.drag_debounce_frames:
                     pyautogui.mouseDown()
                     self.is_dragging = True
+                    self._drag_on_counter = 0
+                    self._drag_off_counter = 0
                     print("🖱️  Drag started")
             else:
-                # Reset gesture states
-                if self.is_dragging:
+                if drag_dist > self.drag_end_threshold:
+                    self._drag_off_counter += 1
+                else:
+                    self._drag_off_counter = 0
+                if self._drag_off_counter >= self.drag_debounce_frames:
                     pyautogui.mouseUp()
                     self.is_dragging = False
+                    self._drag_off_counter = 0
                     print("🖱️  Drag ended")
-                self.is_clicking = False
-                self.is_scrolling = False
+
+            # Reset non-drag gesture flags (keep drag state independent)
+            self.is_clicking = False
+            self.is_scrolling = False
         
         # Keyboard shortcuts mode
-        elif keyboard_mode:
+        elif keyboard_mode and self.settings.get('shortcuts_enabled', True):
             self.modes['keyboard'] = True
             self.modes['mouse'] = False
             
@@ -509,7 +683,7 @@ class VirtualMouse:
                 self.last_click_time = current_time
         
         # Voice command mode
-        elif voice_mode:
+        elif voice_mode and self.settings.get('voice_commands_enabled', False):
             self.modes['voice'] = True
             self.modes['mouse'] = False
             
@@ -520,29 +694,39 @@ class VirtualMouse:
                 self.last_click_time = current_time
         
         # App launcher mode
-        elif app_launcher_mode:
+        elif app_launcher_mode and self.settings.get('apps_enabled', False):
             self.modes['app_launcher'] = True
             self.modes['mouse'] = False
-            
-            if current_time - self.last_click_time > self.click_cooldown:
+
+            # Require the gesture to be held for a configurable duration
+            if self.app_launcher_detected_since is None:
+                self.app_launcher_detected_since = current_time
+
+            hold_ok = (current_time - self.app_launcher_detected_since) >= self.settings.get('app_launcher_hold_seconds', 1.0)
+            cooldown_ok = (current_time - self.last_click_time) > self.click_cooldown
+            if hold_ok and cooldown_ok:
                 thumb_pos = gesture_data['thumb_pos']
                 wrist_pos = gesture_data['wrist_pos']
-                
-                if thumb_pos[1] < wrist_pos[1] - 20:  # Thumb up
+
+                # Stronger thumb-direction thresholds to reduce false positives
+                if thumb_pos[1] < wrist_pos[1] - 40:  # Thumb up
                     self.launch_application('safari')
-                elif thumb_pos[1] > wrist_pos[1] + 20:  # Thumb down
+                elif thumb_pos[1] > wrist_pos[1] + 40:  # Thumb down
                     self.launch_application('finder')
-                elif thumb_pos[0] < wrist_pos[0] - 20:  # Thumb left
+                elif thumb_pos[0] < wrist_pos[0] - 40:  # Thumb left
                     self.launch_application('terminal')
-                elif thumb_pos[0] > wrist_pos[0] + 20:  # Thumb right
+                elif thumb_pos[0] > wrist_pos[0] + 40:  # Thumb right
                     self.launch_application('calculator')
-                
+
                 self.last_click_time = current_time
+        else:
+            # Reset app launcher debounce when not in app launcher mode
+            self.app_launcher_detected_since = None
         
         # Emergency quit gesture: All fingers closed (fist)
-        elif (not finger_states['index'] and not finger_states['middle'] and 
-              not finger_states['ring'] and not finger_states['pinky'] and 
-              not finger_states['thumb']):
+        if (not finger_states['index'] and not finger_states['middle'] and 
+            not finger_states['ring'] and not finger_states['pinky'] and 
+            not finger_states['thumb']):
             if current_time - self.last_click_time > 2.0:  # Hold fist for 2 seconds
                 print("🛑 Emergency quit gesture detected!")
                 self.speak("Emergency quit activated")
@@ -632,18 +816,6 @@ class VirtualMouse:
         cv2.putText(frame, f"Dist: {distances['index_thumb']:.0f}", 
                    (index_pos[0] + 10, index_pos[1] - 10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # Draw instructions overlay
-        instructions = [
-            "Press 'q' to quit",
-            "Press 's' for settings",
-            "Press 'h' for help"
-        ]
-        
-        for i, instruction in enumerate(instructions):
-            cv2.putText(frame, instruction, 
-                       (frame_width - 200, frame_height - 60 + i * 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     def show_settings(self):
         """Show settings dialog"""
@@ -740,13 +912,19 @@ class VirtualMouse:
         """Main application loop with enhanced features"""
         print("🎯 Enhanced Virtual Mouse is running!")
         print("Press 'q' to quit, 's' for settings, 'h' for help")
+        print("Performance mode:", "ON" if self.settings.get('performance_mode') else "OFF")
+        print("Overlay drawing:", "ON" if self.settings.get('show_overlay') else "OFF")
+        
+        # Begin capture thread for freshest frames
+        self.start_capture_thread()
         
         try:
             while True:
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("Error: Could not read from camera")
-                    break
+                frame = self.get_latest_frame()
+                if frame is None:
+                    # Small sleep to avoid busy-waiting before frames arrive
+                    time.sleep(0.001)
+                    continue
                 
                 # Flip frame horizontally for mirror effect
                 frame = cv2.flip(frame, 1)
@@ -761,27 +939,71 @@ class VirtualMouse:
                 if results.multi_hand_landmarks:
                     for hand_landmarks in results.multi_hand_landmarks:
                         # Draw hand landmarks
-                        self.mp_drawing.draw_landmarks(
-                            frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                        if self.settings.get('show_overlay', False):
+                            self.mp_drawing.draw_landmarks(
+                                frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
                         
                         # Detect gestures
                         gesture_data = self.detect_gestures(
                             hand_landmarks.landmark, frame_width, frame_height)
                         
-                        # Execute actions based on gestures
-                        result = self.execute_gestures(gesture_data)
-                        if result == 'quit':
-                            print("🛑 Quit gesture detected!")
-                            break
+                        # Virtual Keyboard Interaction
+                        key_hovered = False
+                        if self.settings.get('virtual_keyboard_enabled', False):
+                            # Use middle finger for hovering
+                            middle_x, middle_y = gesture_data['middle_pos']
+                            index_x, index_y = gesture_data['index_pos']
+                            
+                            # Draw points on middle and index finger (as requested)
+                            cv2.circle(frame, (middle_x, middle_y), 9, (0, 255, 255), cv2.FILLED)
+                            cv2.circle(frame, (index_x, index_y), 9, (255, 0, 255), cv2.FILLED)
+                            
+                            # Use index finger bending for clicking while middle is open
+                            index_tip_y = hand_landmarks.landmark[8].y
+                            index_dip_y = hand_landmarks.landmark[7].y
+                            
+                            # Click condition: Index bent (tip below dip) AND middle finger extended
+                            is_clicking = index_tip_y > index_dip_y and gesture_data['finger_states']['middle']
+                            
+                            if is_clicking:
+                                # Change middle finger circle color to green when clicking
+                                cv2.circle(frame, (middle_x, middle_y), 9, (0, 255, 0), cv2.FILLED)
+                            
+                            # Draw highlighter and handle click
+                            for x, y, h, w, key_str in self.vk_buttonList:
+                                if x < middle_x < h and y < middle_y < w:
+                                    key_hovered = True
+                                    cv2.rectangle(frame, (x, y), (h, w), (0, 255, 0), cv2.FILLED)
+                                    cv2.putText(frame, key_str, (x + 12, y + 29), cv2.FONT_HERSHEY_PLAIN, 2, (0, 0, 0), 2)
+                                    if is_clicking and self.vk_clk > 0:
+                                        pyautogui.press(key_str)
+                                        self.vk_clk = -1
+                                        print(f"⌨️  Virtual Key pressed: {key_str}")
+                                        
+                            if not is_clicking:
+                                self.vk_clk = 1
+                        
+                        # Execute actions based on gestures only if we aren't hovering over a virtual key
+                        if not key_hovered:
+                            result = self.execute_gestures(gesture_data)
+                            if result == 'quit':
+                                print("🛑 Quit gesture detected!")
+                                break
                         
                         # Draw comprehensive information
-                        self.draw_landmarks_and_info(frame, gesture_data)
+                        if self.settings.get('show_overlay', False):
+                            self.draw_landmarks_and_info(frame, gesture_data)
                 
                 # Display frame
+                if self.settings.get('virtual_keyboard_enabled', False):
+                    self.draw_virtual_keyboard(frame)
+                    
+                if self.settings.get('show_usage', True):
+                    self.draw_usage_overlay(frame)
                 cv2.imshow('🎯 Enhanced Virtual Mouse - Full Device Control', frame)
                 
-                # Handle keyboard shortcuts with longer wait time for better responsiveness
-                key = cv2.waitKey(30) & 0xFF
+                # Shorter waitKey to reduce artificial latency
+                key = cv2.waitKey(1) & 0xFF
                 
                 if key == ord('q') or key == 27:  # 'q' or ESC key
                     print("🛑 Quit command received!")
@@ -801,6 +1023,32 @@ class VirtualMouse:
                         'voice': False,
                         'app_launcher': False
                     }
+                elif key == ord('o'):
+                    self.settings['show_overlay'] = not self.settings.get('show_overlay', False)
+                    print("🎨 Overlay:", "ON" if self.settings['show_overlay'] else "OFF")
+                elif key == ord('p'):
+                    self.settings['performance_mode'] = not self.settings.get('performance_mode', False)
+                    self.apply_performance_settings()
+                    print("⚡ Performance mode:", "ON" if self.settings['performance_mode'] else "OFF")
+                elif key == ord('u'):
+                    self.settings['show_usage'] = not self.settings.get('show_usage', True)
+                    print("📋 Usage panel:", "ON" if self.settings['show_usage'] else "OFF")
+                elif key == ord('a'):
+                    self.settings['apps_enabled'] = not self.settings.get('apps_enabled', False)
+                    state = "ON" if self.settings['apps_enabled'] else "OFF"
+                    print(f"🚀 App launcher: {state}")
+                elif key == ord('v'):
+                    self.settings['voice_commands_enabled'] = not self.settings.get('voice_commands_enabled', False)
+                    state = "ON" if self.settings['voice_commands_enabled'] else "OFF"
+                    print(f"🎤 Voice commands: {state}")
+                elif key == ord('k'):
+                    self.settings['shortcuts_enabled'] = not self.settings.get('shortcuts_enabled', True)
+                    state = "ON" if self.settings['shortcuts_enabled'] else "OFF"
+                    print(f"⌨️  Keyboard shortcuts: {state}")
+                elif key == ord('b'):
+                    self.settings['virtual_keyboard_enabled'] = not self.settings.get('virtual_keyboard_enabled', False)
+                    state = "ON" if self.settings['virtual_keyboard_enabled'] else "OFF"
+                    print(f"⌨️  Virtual Keyboard: {state}")
                 
                 # Check if window was closed
                 if cv2.getWindowProperty('🎯 Enhanced Virtual Mouse - Full Device Control', cv2.WND_PROP_VISIBLE) < 1:
@@ -819,6 +1067,7 @@ class VirtualMouse:
         """Clean up resources"""
         try:
             print("🔄 Releasing camera...")
+            self.running = False
             if hasattr(self, 'cap') and self.cap.isOpened():
                 self.cap.release()
             
